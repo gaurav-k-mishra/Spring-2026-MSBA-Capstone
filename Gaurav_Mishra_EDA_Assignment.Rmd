@@ -1,0 +1,284 @@
+---
+title: "EDA"
+author: "Gaurav Mishra"
+date: "2026-02-22"
+output: html_document
+---
+# Background 
+- Each row = one QAL lead
+- QAL = Qualified Account Lead 
+- Someone showed interest and was qualified enough to enter the pipeline
+- This dataset tracks marketing leads and what happened to them in the sales funnel
+
+
+```{r}
+# Install if needed
+install.packages("tidyverse")
+install.packages("janitor")
+install.packages("lubridate")
+
+# Load
+library(tidyverse)
+library(janitor)
+library(lubridate)
+```
+
+
+```{r}
+df <- read_csv("~/Downloads/QAL Performance for MSBA.csv")
+```
+
+## Structural Checks
+- 16,812 rows and 14 columns 
+```{r}
+dim(df)
+glimpse(df)
+```
+# Converting variable names to lowercase with underscores
+```{r}
+df <- df %>% clean_names()
+names(df)
+```
+# Filtered out records with missing values
+
+```{r}
+df %>%
+  count(next_stage_c, sort = TRUE)
+```
+
+
+```{r}
+df_clean <- df %>%
+  filter(!is.na(next_stage_c))
+
+```
+
+# Show how many rows were removed
+```{r}
+nrow(df) - nrow(df_clean)
+
+```
+
+# Baseline conversion rate
+- 16-17%
+```{r}
+df_clean %>%
+  summarise(
+    total = n(),
+    sqls = sum(next_stage_c == "SQL"),
+    conversion_rate = sqls / total
+  )
+
+```
+# Conversion by Marketing Channel
+
+# Best performing channels --> highest quality leads 
+- Direct/Inbound
+- SEP
+- Online Ads
+
+```{r}
+df_clean %>%
+  group_by(last_tactic_campaign_channel) %>%
+  summarise(
+    total_leads = n(),
+    sqls = sum(next_stage_c == "SQL"),
+    conversion_rate = sqls / total_leads
+  ) %>%
+  arrange(desc(conversion_rate))
+```
+
+# Conversion by industry
+
+# Highest SQL Conversion Rate
+- Blood & biologics
+- Medical devices
+- Pharma & BioTech 
+```{r}
+df_clean %>%
+  group_by(acct_target_industry) %>%
+  summarise(
+    total_leads = n(),
+    sqls = sum(next_stage_c == "SQL"),
+    conversion_rate = sqls / total_leads
+  ) %>%
+  arrange(desc(conversion_rate))
+
+```
+
+# Conversion by Account Tier 
+- Small accounts convert best, medium, then large
+
+```{r}
+df_clean %>%
+  group_by(acct_tier_rollup) %>%
+  summarise(
+    total_leads = n(),
+    sqls = sum(next_stage_c == "SQL"),
+    conversion_rate = sqls / total_leads
+  ) %>%
+  arrange(desc(conversion_rate))
+
+```
+
+# Industry x Tier
+```{r}
+df_clean %>%
+  group_by(acct_target_industry, acct_tier_rollup) %>%
+  summarise(
+    total_leads = n(),
+    sqls = sum(next_stage_c == "SQL"),
+    conversion_rate = sqls / total_leads,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(conversion_rate))
+
+```
+
+# Time Trend
+```{r}
+library(lubridate)
+
+df_clean %>%
+  mutate(month = floor_date(qal_cohort_date, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    total_leads = n(),
+    sqls = sum(next_stage_c == "SQL"),
+    conversion_rate = sqls / total_leads
+  ) %>%
+  arrange(month)
+
+```
+
+# Visualization
+```{r}
+library(ggplot2)
+
+df_clean %>%
+  mutate(month = floor_date(qal_cohort_date, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    total_leads = n(),
+    sqls = sum(next_stage_c == "SQL"),
+    conversion_rate = sqls / total_leads
+  ) %>%
+  ggplot(aes(x = month, y = conversion_rate)) +
+  geom_line(size = 1.2, color = "steelblue") +
+  geom_point(size = 2) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Monthly SQL Conversion Rate",
+    x = "Month",
+    y = "Conversion Rate"
+  ) +
+  theme_minimal()
+
+```
+# Verify if spike is normal
+```{r}
+df_clean %>%
+  mutate(month = floor_date(qal_cohort_date, "month")) %>%
+  group_by(month) %>%
+  summarise(total_leads = n()) %>%
+  arrange(desc(month))
+```
+
+
+```{r}
+df_clean %>%
+  mutate(month = floor_date(qal_cohort_date, "month")) %>%
+  group_by(month) %>%
+  summarise(total_leads = n()) %>%
+  ggplot(aes(month, total_leads)) +
+  geom_line(linewidth = 1.2) +
+  geom_point() +
+  labs(
+    title = "Monthly Lead Volume",
+    x = "Month",
+    y = "Total Leads"
+  ) +
+  theme_minimal()
+```
+# Overall SQL Rate
+- Baseline conversion rate - 16 - 17%
+```{r}
+df_clean %>%
+  mutate(is_sql = next_stage_c == "SQL") %>%
+  count(is_sql) %>%
+  mutate(percentage = n / sum(n))
+```
+# Territory conversion
+- Japan has highest conversion rate but has a very small smaple size 
+```{r}
+df_clean %>%
+  group_by(acct_territory_rollup) %>%
+  summarise(
+    total_leads = n(),
+    sqls = sum(next_stage_c == "SQL"),
+    conversion_rate = sqls / total_leads
+  ) %>%
+  arrange(desc(conversion_rate))
+```
+
+```{r}
+library(scales)
+
+heat_data <- df_clean %>%
+  group_by(acct_target_industry, acct_tier_rollup) %>%
+  summarise(
+    conversion_rate = mean(next_stage_c == "SQL"),
+    .groups = "drop"
+  )
+
+ggplot(heat_data, 
+       aes(acct_tier_rollup, acct_target_industry, fill = conversion_rate)) +
+  geom_tile() +
+  scale_fill_gradient(
+    low = "white",
+    high = "steelblue",
+    labels = scales::percent_format()
+  ) +
+  labs(
+    title = "Conversion Rate Heatmap",
+    x = "Account Tier",
+    y = "Industry",
+    fill = "Conversion"
+  ) +
+  theme_minimal()
+```
+# Industry Conversion
+- Above baseline -- blood & biologic and medical device perform stronger than baseline
+
+```{r}
+df_clean %>%
+  mutate(is_sql = next_stage_c == "SQL") %>%
+  group_by(acct_target_industry, is_sql) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(acct_target_industry) %>%
+  mutate(pct = count / sum(count))
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```

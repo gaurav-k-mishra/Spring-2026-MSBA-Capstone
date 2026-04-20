@@ -1,0 +1,615 @@
+---
+title: "Group 2: MasterControl Modeling Notebook"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+# Introduction
+
+Building on our EDA findings, this notebook develops and evaluates classification
+models to predict whether a MasterControl sales lead (QAL) will progress to the
+next stage (SQL, SQO, or Won). Our primary business objective is to identify the
+highest-converting account and title profiles for the **Mx** (Manufacturing)
+product, which currently underperforms Qx by 7 percentage points (12.7% vs 19.7%).
+
+Three models are compared:
+
+- **Logistic Regression** (LASSO-penalized) — interpretable baseline
+- **Random Forest** — captures non-linear relationships and interactions
+- **Gradient Boosted Trees (GBM)** — typically highest predictive accuracy
+
+The best-performing model is used to extract feature importance and generate
+actionable targeting recommendations.
+
+---
+
+# Setup
+
+```{r libraries}
+suppressMessages(suppressWarnings({
+  library(tidyverse)
+  library(caret)
+  library(randomForest)
+  library(ranger)
+  library(glmnet)
+  library(pROC)
+  library(rsample)
+  library(recipes)
+  library(themis)
+}))
+
+set.seed(42)
+```
+
+---
+
+# Data Preparation
+
+We replicate the cleaning pipeline from the EDA notebook, then add
+model-ready feature engineering.
+
+## Load & Clean
+
+```{r load-data}
+master <- read.csv("~/Downloads/Mastercontrol QAL Performance.csv")
+
+# Convert blanks to NA
+master_clean <- master |>
+  mutate(across(where(is.character), ~ na_if(., "")))
+
+# Drop rows where small-NA columns are missing
+master_clean <- master_clean |>
+  filter(
+    !is.na(acct.target.industry),
+    !is.na(contact.lead.id),
+    !is.na(next_stage__c),
+    !is.na(acct.territory.rollup),
+    !is.na(acct.tier.rollup)
+  )
+
+# Fill large-NA columns with "Missing"
+master_clean <- master_clean |>
+  mutate(across(
+    c(acct.primary.site.function, acct.manufacturing.model, contact.lead.title),
+    ~ ifelse(is.na(.), "Missing", .)
+  ))
+
+cat("Rows after cleaning:", nrow(master_clean), "\n")
+cat("Columns:", ncol(master_clean), "\n")
+```
+
+## Create Target Variable
+
+```{r target-variable}
+master_clean <- master_clean |>
+  mutate(
+    success_binary = factor(
+      ifelse(next_stage__c %in% c("SQL", "SQO", "Won"), "Success", "Failure"),
+      levels = c("Failure", "Success")
+    )
+  )
+
+prop.table(table(master_clean$success_binary)) |> round(3)
+```
+
+The dataset has an ~18% positive class — moderately imbalanced but manageable
+with class weighting or sampling techniques.
+
+## Feature Engineering
+
+We apply the same grouping logic from the EDA, plus add date-based features
+and a simplified priority flag.
+
+```{r feature-engineering}
+# ---- Title grouping (from EDA) ----
+master_clean <- master_clean |>
+  mutate(
+    contact.lead.title = str_trim(str_to_upper(contact.lead.title)),
+    title_group = case_when(
+      str_detect(contact.lead.title, "CHIEF|CEO|CFO|CTO|COO|CIO|PRESIDENT|OWNER|FOUNDER|EXECUTIVE|DIR") ~ "Executive",
+      str_detect(contact.lead.title, "VP|VICE PRESIDENT|HEAD") ~ "VP_Head",
+      str_detect(contact.lead.title, "DIRECTOR") ~ "Director",
+      str_detect(contact.lead.title, "MANAGER|SUPERVISOR|MANGER") ~ "Manager",
+      str_detect(contact.lead.title, "ENGINEER|SCIENTIST|TECHNICAL|DEVELOPER|LEAD|TECHNICIAN|ARCHITECT") ~ "Technical",
+      str_detect(contact.lead.title, "ANALYST") ~ "Analyst",
+      str_detect(contact.lead.title, "SPECIALIST|ASSOCIATE|COORDINATOR") ~ "Specialist",
+      str_detect(contact.lead.title, "CONSULTANT|CONSULTING") ~ "Consultant",
+      str_detect(contact.lead.title, "MISSING") ~ "Unknown",
+      str_detect(contact.lead.title, "PROFESSOR|RESEARCHER|RESEARCH|LECTURER|PROF") ~ "Academia",
+      str_detect(contact.lead.title, "SALES") ~ "Sales",
+      TRUE ~ "Other"
+    )
+  )
+
+# ---- Site function grouping ----
+master_clean <- master_clean |>
+  mutate(
+    acct.primary.site.function = str_to_upper(acct.primary.site.function),
+    site_function_group = case_when(
+      str_detect(acct.primary.site.function, "OSD|ORAL SOLID|STERILE|INJECTABLE|\\bAPI\\b|BIOLOGIC|CELL THERAP|CAR-T|GENERICS|DRUG DISCOVERY|SECONDARY PACKAGING") ~ "Active_Pharma_Mfg",
+      str_detect(acct.primary.site.function, "IMPLANTABLE|IVD|SURGICAL|DIAGNOSTIC EQUIPMENT|SINGLE-USE|DISPOSABLE|LAB INSTRUMENT") ~ "Medical_Device_Mfg",
+      str_detect(acct.primary.site.function, "NON-MANUFACTURING|SERVICES|CONSULTING|SOFTWARE|DISTRIBUTION|RESEARCH INSTITUTE|CRO") ~ "Non_Manufacturing",
+      str_detect(acct.primary.site.function, "FOOD|BEVERAGE|NUTRACEUTICAL|COSMETIC|CHEMICAL") ~ "Other_Manufacturing",
+      str_detect(acct.primary.site.function, "MISSING|NOT ENOUGH") ~ "Unknown",
+      TRUE ~ "Other_Manufacturing"
+    )
+  )
+
+# ---- Manufacturing model grouping ----
+master_clean <- master_clean |>
+  mutate(
+    mfg_model_group = case_when(
+      str_detect(str_to_upper(acct.manufacturing.model), "IN-HOUSE|IN HOUSE") ~ "In_House",
+      str_detect(str_to_upper(acct.manufacturing.model), "CDMO") ~ "CDMO",
+      str_detect(str_to_upper(acct.manufacturing.model), "\\bCMO\\b") ~ "CMO",
+      str_detect(str_to_upper(acct.manufacturing.model), "CRO") ~ "CRO",
+      str_detect(str_to_upper(acct.manufacturing.model), "SERVICE|CONSULT") ~ "Services_Consulting",
+      str_detect(str_to_upper(acct.manufacturing.model), "SOFTWARE|TECH") ~ "Software_Tech",
+      str_detect(str_to_upper(acct.manufacturing.model), "DISTRIBUTION|WHOLESALE") ~ "Distribution",
+      str_detect(str_to_upper(acct.manufacturing.model), "MISSING|NOT ENOUGH") ~ "Unknown",
+      TRUE ~ "Other"
+    )
+  )
+
+# ---- Priority grouping ----
+master_clean <- master_clean |>
+  mutate(
+    priority_group = case_when(
+      str_detect(Priority, "P1 - Video Demo|P1 - Live Demo|P1 - Webinar Demo") ~ "P1_Demo",
+      str_detect(Priority, "P1 - Contact Us") ~ "P1_Contact",
+      str_detect(Priority, "P1 - Website Pricing") ~ "P1_Pricing",
+      str_detect(Priority, "P1") ~ "P1_Other",
+      Priority == "Priority 1" ~ "P1_Other",
+      Priority == "Priority 2" ~ "Priority_2",
+      TRUE ~ "Other"
+    )
+  )
+
+# ---- Date features ----
+master_clean <- master_clean |>
+  mutate(
+    qal.cohort.date = as.Date(qal.cohort.date),
+    lead_month    = month(qal.cohort.date),
+    lead_quarter  = quarter(qal.cohort.date),
+    lead_year     = factor(year(qal.cohort.date))
+  )
+
+cat("Feature engineering complete. Columns:", ncol(master_clean), "\n")
+```
+
+## Select Modeling Features
+
+```{r select-features}
+model_data <- master_clean |>
+  select(
+    success_binary,
+    solution_rollup,
+    acct.target.industry,
+    acct.tier.rollup,
+    acct.territory.rollup,
+    last.tactic.campaign.channel,
+    title_group,
+    site_function_group,
+    mfg_model_group,
+    priority_group,
+    lead_month,
+    lead_quarter,
+    lead_year
+  ) |>
+  mutate(across(where(is.character), as.factor))
+
+glimpse(model_data)
+```
+
+---
+
+# Train / Test Split
+
+We use a stratified 80/20 split to preserve the class balance in both sets.
+
+```{r train-test-split}
+split <- initial_split(model_data, prop = 0.8, strata = success_binary)
+train_data <- training(split)
+test_data  <- testing(split)
+
+cat("Training set:", nrow(train_data), "rows |",
+    round(mean(train_data$success_binary == "Success") * 100, 1), "% positive\n")
+cat("Test set:    ", nrow(test_data), "rows |",
+    round(mean(test_data$success_binary == "Success") * 100, 1), "% positive\n")
+```
+
+---
+
+# Model Training
+
+We use `caret` with 5-fold cross-validation and ROC-AUC as the tuning metric.
+Class imbalance is handled via the `class.weights` or `sampling = "up"` arguments.
+
+```{r cv-control}
+ctrl <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+```
+
+## Logistic Regression (LASSO)
+
+LASSO penalization automatically performs feature selection — coefficients for
+weak predictors are shrunk to zero. This gives us a clean, interpretable model.
+
+```{r logistic-lasso}
+# One-hot encode for glmnet
+x_train <- model.matrix(success_binary ~ ., data = train_data)[, -1]
+y_train  <- train_data$success_binary
+
+x_test   <- model.matrix(success_binary ~ ., data = test_data)[, -1]
+y_test   <- test_data$success_binary
+
+# Fit LASSO with cross-validated lambda
+lasso_cv <- cv.glmnet(
+  x_train, y_train,
+  family  = "binomial",
+  alpha   = 1,
+  nfolds  = 5,
+  type.measure = "auc",
+  weights = ifelse(y_train == "Success",
+                   sum(y_train == "Failure") / sum(y_train == "Success"), 1)
+)
+
+cat("Best lambda:", round(lasso_cv$lambda.1se, 5), "\n")
+plot(lasso_cv, main = "LASSO: CV AUC vs. Lambda")
+```
+
+```{r lasso-predict}
+lasso_probs <- predict(lasso_cv, newx = x_test,
+                       s = "lambda.1se", type = "response")[, 1]
+lasso_preds <- factor(ifelse(lasso_probs > 0.5, "Success", "Failure"),
+                      levels = c("Failure", "Success"))
+
+lasso_roc <- roc(y_test, lasso_probs, quiet = TRUE)
+cat("Logistic (LASSO) Test ROC-AUC:", round(auc(lasso_roc), 4), "\n")
+print(confusionMatrix(lasso_preds, y_test, positive = "Success"))
+```
+
+## Random Forest
+
+Random Forest is robust to non-linearities and handles categorical variables well.
+We tune `mtry` (features per split) and use class weighting for imbalance.
+
+```{r random-forest}
+rf_grid <- expand.grid(mtry = c(3, 5, 7),
+                       splitrule = "gini",
+                       min.node.size = c(10, 20))
+
+rf_model <- train(
+  success_binary ~ .,
+  data      = train_data,
+  method    = "ranger",
+  metric    = "ROC",
+  trControl = ctrl,
+  tuneGrid  = rf_grid,
+  num.trees = 300,
+  importance = "impurity",
+  class.weights = c(Failure = 1,
+                    Success = sum(train_data$success_binary == "Failure") /
+                              sum(train_data$success_binary == "Success"))
+)
+
+print(rf_model)
+plot(rf_model, main = "Random Forest: CV ROC by Hyperparameters")
+```
+
+```{r rf-predict}
+rf_probs <- predict(rf_model, newdata = test_data, type = "prob")[, "Success"]
+rf_preds <- predict(rf_model, newdata = test_data)
+
+rf_roc <- roc(y_test, rf_probs, quiet = TRUE)
+cat("Random Forest Test ROC-AUC:", round(auc(rf_roc), 4), "\n")
+print(confusionMatrix(rf_preds, y_test, positive = "Success"))
+```
+
+## Gradient Boosted Trees (GBM)
+
+GBM builds trees sequentially, each correcting the errors of the last. Often
+the top performer for structured tabular data.
+
+```{r gbm}
+gbm_grid <- expand.grid(
+  n.trees           = c(100, 200),
+  interaction.depth = c(3, 5),
+  shrinkage         = c(0.05, 0.1),
+  n.minobsinnode    = 10
+)
+
+gbm_model <- train(
+  success_binary ~ .,
+  data      = train_data,
+  method    = "gbm",
+  metric    = "ROC",
+  trControl = ctrl,
+  tuneGrid  = gbm_grid,
+  verbose   = FALSE
+)
+
+print(gbm_model)
+plot(gbm_model, main = "GBM: CV ROC by Hyperparameters")
+```
+
+```{r gbm-predict}
+gbm_probs <- predict(gbm_model, newdata = test_data, type = "prob")[, "Success"]
+gbm_preds <- predict(gbm_model, newdata = test_data)
+
+gbm_roc <- roc(y_test, gbm_probs, quiet = TRUE)
+cat("GBM Test ROC-AUC:", round(auc(gbm_roc), 4), "\n")
+print(confusionMatrix(gbm_preds, y_test, positive = "Success"))
+```
+
+---
+
+# Model Comparison
+
+```{r model-comparison}
+# ROC curves
+plot(lasso_roc, col = "#E74C3C", lwd = 2,
+     main = "ROC Curves — All Models (Test Set)")
+plot(rf_roc,    col = "#2ECC71", lwd = 2, add = TRUE)
+plot(gbm_roc,   col = "#3498DB", lwd = 2, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+legend("bottomright",
+       legend = c(
+         paste0("LASSO  AUC = ", round(auc(lasso_roc), 3)),
+         paste0("Random Forest  AUC = ", round(auc(rf_roc), 3)),
+         paste0("GBM  AUC = ", round(auc(gbm_roc), 3))
+       ),
+       col = c("#E74C3C", "#2ECC71", "#3498DB"),
+       lwd = 2, cex = 0.9)
+```
+
+```{r comparison-table}
+# Summary table
+comparison <- tibble(
+  Model = c("Logistic (LASSO)", "Random Forest", "GBM"),
+  Test_AUC = c(round(auc(lasso_roc), 4),
+               round(auc(rf_roc), 4),
+               round(auc(gbm_roc), 4)),
+  CV_AUC = c(
+    NA,  # glmnet CV AUC
+    round(max(rf_model$results$ROC), 4),
+    round(max(gbm_model$results$ROC), 4)
+  )
+)
+
+comparison |> arrange(desc(Test_AUC)) |> knitr::kable(caption = "Model Performance Summary")
+```
+
+---
+
+# Feature Importance
+
+We use the best model (typically GBM or RF) to identify which features drive
+lead progression most strongly.
+
+```{r feature-importance-rf}
+# Random Forest variable importance
+rf_imp <- varImp(rf_model, scale = TRUE)
+plot(rf_imp, top = 15, main = "Random Forest: Top 15 Feature Importances")
+```
+
+```{r feature-importance-gbm}
+# GBM variable importance
+library(gbm)
+gbm_imp <- varImp(gbm_model, scale = TRUE)
+plot(gbm_imp, top = 15, main = "GBM: Top 15 Feature Importances")
+```
+
+
+```{r lasso-coefficients}
+# LASSO non-zero coefficients (selected features)
+lasso_coefs <- coef(lasso_cv, s = "lambda.1se")
+lasso_coef_df <- as.data.frame(as.matrix(lasso_coefs))
+colnames(lasso_coef_df) <- "coefficient"
+lasso_coef_df <- lasso_coef_df |>
+  rownames_to_column("feature") |>
+  filter(coefficient != 0, feature != "(Intercept)") |>
+  arrange(desc(abs(coefficient)))
+
+cat("LASSO selected", nrow(lasso_coef_df), "non-zero features\n\n")
+lasso_coef_df |> head(20) |> knitr::kable(caption = "Top LASSO Coefficients")
+```
+
+---
+
+# Mx vs. Qx Subgroup Analysis
+
+A core objective is understanding *why* Mx underperforms Qx. We train separate
+models on Mx and Qx leads and compare which features drive each.
+
+```{r mx-qx-split}
+mx_data <- model_data |> filter(solution_rollup == "Mx") |> select(-solution_rollup)
+qx_data <- model_data |> filter(solution_rollup == "Qx") |> select(-solution_rollup)
+
+cat("Mx leads:", nrow(mx_data), "| Positive rate:", round(mean(mx_data$success_binary == "Success") * 100, 1), "%\n")
+cat("Qx leads:", nrow(qx_data), "| Positive rate:", round(mean(qx_data$success_binary == "Success") * 100, 1), "%\n")
+```
+
+```{r mx-model}
+mx_split <- initial_split(mx_data, prop = 0.8, strata = success_binary)
+mx_train  <- training(mx_split)
+mx_test   <- testing(mx_split)
+
+mx_rf <- train(
+  success_binary ~ .,
+  data      = mx_train,
+  method    = "ranger",
+  metric    = "ROC",
+  trControl = ctrl,
+  tuneGrid  = expand.grid(mtry = c(3, 5), splitrule = "gini", min.node.size = 10),
+  num.trees = 300,
+  importance = "impurity",
+  class.weights = c(Failure = 1,
+                    Success = sum(mx_train$success_binary == "Failure") /
+                              sum(mx_train$success_binary == "Success"))
+)
+
+mx_probs <- predict(mx_rf, newdata = mx_test, type = "prob")[, "Success"]
+mx_roc   <- roc(mx_test$success_binary, mx_probs, quiet = TRUE)
+cat("Mx Random Forest Test AUC:", round(auc(mx_roc), 4), "\n")
+
+mx_imp <- varImp(mx_rf, scale = TRUE)
+plot(mx_imp, top = 12, main = "Mx Model: Top Feature Importances")
+```
+
+```{r qx-model}
+qx_split <- initial_split(qx_data, prop = 0.8, strata = success_binary)
+qx_train  <- training(qx_split)
+qx_test   <- testing(qx_split)
+
+qx_rf <- train(
+  success_binary ~ .,
+  data      = qx_train,
+  method    = "ranger",
+  metric    = "ROC",
+  trControl = ctrl,
+  tuneGrid  = expand.grid(mtry = c(3, 5), splitrule = "gini", min.node.size = 10),
+  num.trees = 300,
+  importance = "impurity",
+  class.weights = c(Failure = 1,
+                    Success = sum(qx_train$success_binary == "Failure") /
+                              sum(qx_train$success_binary == "Success"))
+)
+
+qx_probs <- predict(qx_rf, newdata = qx_test, type = "prob")[, "Success"]
+qx_roc   <- roc(qx_test$success_binary, qx_probs, quiet = TRUE)
+cat("Qx Random Forest Test AUC:", round(auc(qx_roc), 4), "\n")
+
+qx_imp <- varImp(qx_rf, scale = TRUE)
+plot(qx_imp, top = 12, main = "Qx Model: Top Feature Importances")
+```
+
+---
+
+# Segment-Level Conversion Analysis
+
+We compute observed conversion rates across key segments to provide
+concrete targeting recommendations.
+
+```{r segment-analysis}
+# Conversion by industry x product
+industry_conv <- master_clean |>
+  group_by(solution_rollup, acct.target.industry) |>
+  summarise(
+    n_leads      = n(),
+    n_success    = sum(success_binary == "Success"),
+    conv_rate    = round(n_success / n_leads * 100, 1),
+    .groups      = "drop"
+  ) |>
+  filter(n_leads >= 20) |>
+  arrange(solution_rollup, desc(conv_rate))
+
+industry_conv |> knitr::kable(caption = "Conversion Rate by Industry & Product")
+```
+
+```{r segment-mfg-model}
+# Conversion by manufacturing model x product
+mfg_conv <- master_clean |>
+  group_by(solution_rollup, mfg_model_group) |>
+  summarise(
+    n_leads   = n(),
+    n_success = sum(success_binary == "Success"),
+    conv_rate = round(n_success / n_leads * 100, 1),
+    .groups   = "drop"
+  ) |>
+  filter(n_leads >= 20) |>
+  arrange(solution_rollup, desc(conv_rate))
+
+mfg_conv |> knitr::kable(caption = "Conversion Rate by Manufacturing Model & Product")
+```
+
+```{r segment-title}
+# Conversion by title group x product
+title_conv <- master_clean |>
+  group_by(solution_rollup, title_group) |>
+  summarise(
+    n_leads   = n(),
+    n_success = sum(success_binary == "Success"),
+    conv_rate = round(n_success / n_leads * 100, 1),
+    .groups   = "drop"
+  ) |>
+  filter(n_leads >= 30) |>
+  arrange(solution_rollup, desc(conv_rate))
+
+title_conv |> knitr::kable(caption = "Conversion Rate by Title Group & Product")
+```
+
+```{r segment-priority}
+# Conversion by priority x product
+priority_conv <- master_clean |>
+  group_by(solution_rollup, priority_group) |>
+  summarise(
+    n_leads   = n(),
+    n_success = sum(success_binary == "Success"),
+    conv_rate = round(n_success / n_leads * 100, 1),
+    .groups   = "drop"
+  ) |>
+  filter(n_leads >= 20) |>
+  arrange(solution_rollup, desc(conv_rate))
+
+priority_conv |> knitr::kable(caption = "Conversion Rate by Priority & Product")
+```
+
+```{r segment-heatmap}
+# Heatmap: Industry x Title Group for Mx only
+mx_heatmap <- master_clean |>
+  filter(solution_rollup == "Mx") |>
+  group_by(acct.target.industry, title_group) |>
+  summarise(
+    n_leads   = n(),
+    conv_rate = mean(success_binary == "Success"),
+    .groups   = "drop"
+  ) |>
+  filter(n_leads >= 15)
+
+ggplot(mx_heatmap, aes(x = title_group, y = acct.target.industry, fill = conv_rate)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(round(conv_rate * 100, 0), "%")),
+            size = 3, color = "black") +
+  scale_fill_gradient(low = "white", high = "#2C7BB6",
+                      labels = scales::percent_format()) +
+  labs(
+    title    = "Mx Conversion Rate Heatmap: Industry × Title",
+    x        = "Title Group",
+    y        = "Target Industry",
+    fill     = "Conv. Rate"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+```
+
+---
+
+# Results & Recommendations
+
+## Model Performance Summary
+
+```{r final-comparison}
+comparison |> arrange(desc(Test_AUC)) |> knitr::kable()
+```
+
+The **Random Forest** model achieves the highest test AUC (0.8485), followed closely by **GBM** (0.8478).
+Logistic Regression provides a useful interpretability benchmark.
+All three models confirm the same key patterns identified below
+
