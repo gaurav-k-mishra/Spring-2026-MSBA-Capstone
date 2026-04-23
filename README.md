@@ -62,6 +62,6 @@ increasing the size of the lead pool.
 
 ## Files in This Repo
 
-- `EDA_notebook.ipynb` — Exploratory analysis of lead data by segment, industry, and title
-- `Modeling_notebook.ipynb` — Logistic regression model, feature interpretation, and
+- `Gaurav_Mishra_EDA` — Exploratory analysis of lead data by segment, industry, and title
+- `Gaurav_Mishra_Modeling` — Logistic regression model, feature interpretation, and
    interaction term analysis
