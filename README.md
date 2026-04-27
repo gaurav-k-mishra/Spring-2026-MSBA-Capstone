@@ -2,7 +2,6 @@
 **Spring 2026 MSBA Capstone | University of Utah**
 
 ## Project Overview
-
 MasterControl is a B2B SaaS company selling quality management software to life sciences
 and manufacturing companies. Their sales team generates thousands of qualified leads
 (QALs) each year across two product lines — Mx and Qx — but conversion rates vary
@@ -14,7 +13,6 @@ Our team analyzed 16,644 historical sales leads to answer two questions:
 2. What actions can sales leadership take to improve conversion rates?
 
 ## What I Did
-
 - Cleaned and explored the full QAL dataset, identifying patterns across industry,
   account type, title, and product line
 - Built a logistic regression model to predict lead conversion probability
@@ -37,7 +35,7 @@ Leads flagged as high-priority convert at 28.2%, nearly double the baseline.
 Focusing outreach here is the highest-leverage move available.
 
 **Title signals are counterintuitive.**
-Manager-level contacts actually outperform executive-level contacts on Mx — 
+Manager-level contacts actually outperform executive-level contacts on Mx —
 suggesting that the person closest to the pain point, not the budget holder,
 drives more conversions at this stage.
 
@@ -46,7 +44,6 @@ Contact-level analysis revealed accounts with both Mx and Qx touchpoints,
 pointing to a structured cross-sell motion MasterControl hasn't fully operationalized.
 
 ## Business Impact
-
 If MasterControl shifts outreach toward high-conversion segments — CMO/CDMO accounts,
 high-priority leads, and manager-level contacts — our model projects moving Mx
 conversion from 13% to 17%, yielding approximately **163 additional conversions per year**.
@@ -54,14 +51,35 @@ At typical SaaS deal values, this represents a meaningful revenue lift without
 increasing the size of the lead pool.
 
 ## Tools & Methods
-
 - Python (pandas, scikit-learn, matplotlib, seaborn)
 - Logistic Regression with interaction terms
 - Exploratory Data Analysis
 - PowerPoint for executive-facing presentation
 
 ## Files in This Repo
-
 - `Gaurav_Mishra_EDA` — Exploratory analysis of lead data by segment, industry, and title
 - `Gaurav_Mishra_Modeling` — Logistic regression model, feature interpretation, and
-   interaction term analysis
+  interaction term analysis
+
+## Challenges
+The dataset had meaningful missingness in several key fields — particularly job title
+and site function — which required careful decisions about imputation vs. exclusion.
+Getting those groupings right mattered a lot, since noisy title data could easily
+obscure real conversion signal.
+
+The bigger challenge was translating model outputs into something actionable for a
+non-technical client. Odds ratios and AUC scores don't land in a boardroom — so a
+significant part of the work was figuring out how to communicate model findings as
+concrete segment-level conversion rates that a sales team could actually act on.
+
+## What I Learned
+Working with messy, real-world CRM data is fundamentally different from working with
+clean datasets. Most of the analytical lift happened before any modeling — in
+understanding the data structure, deciding how to handle missing values, and building
+meaningful feature groupings from free-text fields like job title.
+
+I also learned that the most technically sophisticated model isn't always the most
+useful one. Logistic regression with interaction terms outperformed more complex
+approaches on interpretability, which was the thing that actually mattered for
+this client. Picking the right tool for the audience is as important as picking
+the right tool for the data.
